@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sheet 輸入工具</title>
+<style>
+:root{--bg:#14161a;--card:#1f2329;--line:#343a43;--txt:#e8eaed;--sub:#9aa0a6;--acc:#8ab4f8;--ok:#81c995;--err:#f28b82}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--txt);font:16px/1.5 -apple-system,"Noto Sans TC",sans-serif;padding:10px}
+h1{font-size:20px;margin:4px 0 10px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px;margin-bottom:12px}
+label{display:block;font-size:13px;color:var(--sub);margin:8px 0 4px}
+select,input,textarea,button{font:inherit;color:var(--txt);background:#0f1114;border:1px solid var(--line);border-radius:8px;padding:9px}
+select,input,textarea{width:100%}
+textarea{min-height:90px;resize:vertical}
+.row{display:flex;gap:8px;align-items:flex-end}
+.row>*{flex:1}
+.row .small{flex:0 0 90px}
+button{cursor:pointer;background:#2b3138}
+button.primary{background:var(--acc);color:#0b1626;border-color:var(--acc);font-weight:600}
+button.danger{color:var(--err)}
+button:disabled{opacity:.4}
+.btns{display:flex;gap:8px;margin-top:10px;flex-wrap:wrap}
+.btns button{flex:1;min-width:90px}
+#status{font-size:14px;min-height:20px;margin-top:8px;color:var(--sub)}
+#status.ok{color:var(--ok)}#status.err{color:var(--err)}
+.gridwrap{overflow:auto;max-height:60vh;border:1px solid var(--line);border-radius:8px}
+table{border-collapse:collapse;font-size:14px}
+th,td{border:1px solid var(--line);padding:4px 6px;max-width:140px;min-width:56px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;height:34px}
+th{background:#2b3138;color:var(--sub);position:sticky;top:0;z-index:2;font-weight:500}
+th.rh{left:0;z-index:3;position:sticky}
+td.rh{background:#2b3138;color:var(--sub);position:sticky;left:0;z-index:1;text-align:center}
+td{cursor:pointer}
+td.sel{outline:2px solid var(--acc);outline-offset:-2px;background:#1c2b44}
+.hint{font-size:12px;color:var(--sub);margin-top:6px}
+</style>
+</head>
+<body>
+<h1>Sheet 輸入工具</h1>
+
+<div class="card">
+  <div class="btns" style="margin-top:0">
+    <button id="btnLogin" class="primary">Google 登入</button>
+    <button id="btnReload" disabled>重新載入</button>
+  </div>
+  <div id="status">請先登入 Google</div>
+</div>
+
+<div class="card">
+  <label>分頁</label>
+  <select id="tab" disabled></select>
+
+  <div class="row">
+    <div class="small">
+      <label>儲存格</label>
+      <input id="addr" placeholder="A1" autocapitalize="characters">
+    </div>
+    <div>
+      <label>目前內容</label>
+      <input id="cur" readonly placeholder="（空）">
+    </div>
+  </div>
+
+  <label>輸入新內容</label>
+  <textarea id="val" placeholder="輸入要寫入的內容"></textarea>
+
+  <div class="btns">
+    <button id="btnWrite" class="primary" disabled>寫入該格</button>
+    <button id="btnClear" class="danger" disabled>清空該格</button>
+  </div>
+  <div class="hint">可在下方表格點選儲存格，或直接輸入位置（例如 B3）。</div>
+</div>
+
+<div class="card">
+  <label style="margin-top:0">表格內容（點選儲存格）</label>
+  <div class="gridwrap"><table id="grid"></table></div>
+</div>
+
+<script src="https://accounts.google.com/gsi/client" async defer></script>
+<script>
+const CLIENT_ID = '539262270350-359cuo3a7l5onpijsuav4elbchrrfopl.apps.googleusercontent.com';
+const SHEET_ID  = '1kC8j1xmgHmuiBJCiRhBJzsvbucTVEfCDPQLCa2KuJvY';
+const SCOPE     = 'https://www.googleapis.com/auth/spreadsheets';
+const API       = 'https://sheets.googleapis.com/v4/spreadsheets/' + SHEET_ID;
+const MIN_ROWS = 30, MIN_COLS = 8, FETCH_RANGE = 'A1:Z300';
+
+const $ = id => document.getElementById(id);
+let token = null, tokenClient = null, data = [], rows = MIN_ROWS, cols = MIN_COLS, selR = 0, selC = 0;
+
+function setStatus(msg, cls){ const s=$('status'); s.textContent=msg; s.className=cls||''; }
+
+function colName(i){ let s=''; i++; while(i>0){ const m=(i-1)%26; s=String.fromCharCode(65+m)+s; i=Math.floor((i-1)/26);} return s; }
+function colIndex(letters){ let n=0; for(const ch of letters){ n=n*26+(ch.charCodeAt(0)-64);} return n-1; }
+function parseAddr(a){ const m=/^([A-Za-z]{1,3})(\d{1,5})$/.exec(a.trim()); if(!m) return null; return {c:colIndex(m[1].toUpperCase()), r:parseInt(m[2],10)-1}; }
+function addrOf(r,c){ return colName(c)+(r+1); }
+function q(title){ return "'" + title.replace(/'/g,"''") + "'"; }
+
+function initAuth(){
+  if(!window.google || !google.accounts){ setTimeout(initAuth,300); return; }
+  tokenClient = google.accounts.oauth2.initTokenClient({
+    client_id: CLIENT_ID,
+    scope: SCOPE,
+    callback: async resp=>{
+      if(resp.error){ setStatus('登入失敗：'+resp.error,'err'); return; }
+      token = resp.access_token;
+      setStatus('已登入，載入分頁中…');
+      $('btnLogin').textContent='已登入';
+      $('btnReload').disabled=false;
+      await loadTabs();
+    }
+  });
+}
+initAuth();
+
+$('btnLogin').onclick = ()=>{ if(!tokenClient){ setStatus('Google 登入元件載入中，請稍後再試','err'); return; } tokenClient.requestAccessToken({prompt: token?'':'consent'}); };
+$('btnReload').onclick = ()=>loadGrid();
+
+async function api(url, opt){
+  opt = opt||{};
+  opt.headers = Object.assign({'Authorization':'Bearer '+token}, opt.headers||{});
+  const r = await fetch(url, opt);
+  if(r.status===401){ token=null; $('btnLogin').textContent='重新登入'; $('btnReload').disabled=true; throw new Error('登入已過期，請重新登入'); }
+  const j = await r.json().catch(()=>({}));
+  if(!r.ok) throw new Error((j.error && j.error.message) || ('HTTP '+r.status));
+  return j;
+}
+
+async function loadTabs(){
+  try{
+    const j = await api(API+'?fields=sheets.properties(title)');
+    const sel = $('tab'); sel.innerHTML='';
+    j.sheets.forEach(s=>{ const o=document.createElement('option'); o.value=s.properties.title; o.textContent=s.properties.title; sel.appendChild(o); });
+    sel.disabled=false;
+    await loadGrid();
+  }catch(e){ setStatus('載入分頁失敗：'+e.message,'err'); }
+}
+$('tab').onchange = ()=>loadGrid();
+
+async function loadGrid(){
+  const tab = $('tab').value; if(!tab) return;
+  try{
+    setStatus('讀取中…');
+    const j = await api(API+'/values/'+encodeURIComponent(q(tab)+'!'+FETCH_RANGE));
+    data = j.values || [];
+    const maxC = data.reduce((m,r)=>Math.max(m,r.length),0);
+    rows = Math.max(MIN_ROWS, data.length+5);
+    cols = Math.max(MIN_COLS, maxC+1);
+    renderGrid();
+    selectCell(selR, selC);
+    $('btnWrite').disabled=false; $('btnClear').disabled=false;
+    setStatus('已載入「'+tab+'」','ok');
+  }catch(e){ setStatus('讀取失敗：'+e.message,'err'); }
+}
+
+function cellVal(r,c){ return (data[r] && data[r][c]!==undefined) ? data[r][c] : ''; }
+
+function renderGrid(){
+  const t = $('grid'); let h='<tr><th class="rh"></th>';
+  for(let c=0;c<cols;c++) h+='<th>'+colName(c)+'</th>';
+  h+='</tr>';
+  for(let r=0;r<rows;r++){
+    h+='<tr><td class="rh">'+(r+1)+'</td>';
+    for(let c=0;c<cols;c++){
+      const v = cellVal(r,c).toString().replace(/&/g,'&amp;').replace(/</g,'&lt;');
+      h+='<td data-r="'+r+'" data-c="'+c+'">'+v+'</td>';
+    }
+    h+='</tr>';
+  }
+  t.innerHTML=h;
+}
+
+$('grid').addEventListener('click', e=>{
+  const td = e.target.closest('td[data-r]'); if(!td) return;
+  selectCell(+td.dataset.r, +td.dataset.c);
+});
+
+function selectCell(r,c){
+  selR=r; selC=c;
+  document.querySelectorAll('td.sel').forEach(x=>x.classList.remove('sel'));
+  const td = document.querySelector('td[data-r="'+r+'"][data-c="'+c+'"]');
+  if(td) td.classList.add('sel');
+  $('addr').value = addrOf(r,c);
+  const v = cellVal(r,c);
+  $('cur').value = v;
+  $('val').value = v;
+}
+
+$('addr').addEventListener('change', ()=>{
+  const p = parseAddr($('addr').value);
+  if(!p){ setStatus('位置格式不正確，例如 B3','err'); return; }
+  if(p.r>=rows) { rows=p.r+1; }
+  if(p.c>=cols) { cols=p.c+1; }
+  renderGrid(); selectCell(p.r,p.c);
+  const td = document.querySelector('td.sel'); if(td) td.scrollIntoView({block:'nearest',inline:'nearest'});
+});
+
+async function writeCell(text){
+  const p = parseAddr($('addr').value);
+  if(!p){ setStatus('位置格式不正確，例如 B3','err'); return; }
+  const tab = $('tab').value, a = addrOf(p.r,p.c);
+  try{
+    setStatus('寫入 '+a+' 中…');
+    await api(API+'/values/'+encodeURIComponent(q(tab)+'!'+a)+'?valueInputOption=USER_ENTERED', {
+      method:'PUT',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({range:q(tab)+'!'+a, majorDimension:'ROWS', values:[[text]]})
+    });
+    while(data.length<=p.r) data.push([]);
+    while(data[p.r].length<=p.c) data[p.r].push('');
+    data[p.r][p.c]=text;
+    const td = document.querySelector('td[data-r="'+p.r+'"][data-c="'+p.c+'"]');
+    if(td) td.textContent=text;
+    $('cur').value=text;
+    setStatus('已寫入 '+a,'ok');
+  }catch(e){ setStatus('寫入失敗：'+e.message,'err'); }
+}
+
+$('btnWrite').onclick = ()=>writeCell($('val').value);
+$('btnClear').onclick = ()=>{ if(confirm('確定清空 '+$('addr').value+'？')){ $('val').value=''; writeCell(''); } };
+</script>
+</body>
+</html>
